@@ -1,4 +1,4 @@
-import csv, os, smtplib, base64, urllib.parse
+import csv, os, smtplib, base64, urllib.parse, threading
 from datetime import datetime
 from email.mime.text import MIMEText
 from flask import Flask, request, make_response, send_file
@@ -31,6 +31,7 @@ PIXEL = bytes.fromhex(
     "0000000049454E44AE426082"
 )
 
+# ---------- EMAIL SENDING (background thread to avoid Render timeout) ----------
 def send_alert_email(track_id, subj_decoded, rcpt, ua, ip):
     try:
         if not (SMTP_HOST and SMTP_USER and SMTP_PASS and NOTIFY_TO):
@@ -61,6 +62,12 @@ def send_alert_email(track_id, subj_decoded, rcpt, ua, ip):
     except Exception as e:
         print(f"⚠️ Error sending alert email: {e}")
 
+def send_alert_in_background(track_id, subj_decoded, rcpt, ua, ip):
+    thread = threading.Thread(target=send_alert_email, args=(track_id, subj_decoded, rcpt, ua, ip))
+    thread.daemon = True
+    thread.start()
+
+# ---------- LOGGING ----------
 def log_open(row):
     header = ["time_utc","track_id","subject_b64","subject","recipient","ip","user_agent"]
     file_exists = os.path.exists(CSV_PATH)
@@ -70,6 +77,7 @@ def log_open(row):
             w.writerow(header)
         w.writerow(row)
 
+# ---------- PIXEL ROUTE ----------
 @app.route("/px.png")
 def pixel():
     try:
@@ -101,11 +109,11 @@ def pixel():
         except Exception as e:
             print(f"⚠️ Logging failed: {e}")
 
-        # Try sending alert
+        # Send alert email in background thread
         try:
-            send_alert_email(track_id, subj_decoded, urllib.parse.unquote(rcpt), ua, ip)
+            send_alert_in_background(track_id, subj_decoded, urllib.parse.unquote(rcpt), ua, ip)
         except Exception as e:
-            print(f"⚠️ Alert email failed: {e}")
+            print(f"⚠️ Background alert failed: {e}")
 
         # Always return the pixel, even if logging fails
         resp = make_response(send_file(BytesIO(PIXEL), mimetype="image/png"))
@@ -121,10 +129,12 @@ def pixel():
         resp.headers["Pragma"] = "no-cache"
         return resp
 
+# ---------- ROOT ROUTE ----------
 @app.route("/")
 def ok():
     return "Tracker up and running!"
 
+# ---------- MAIN ----------
 if __name__ == "__main__":
     PORT = int(os.getenv("PORT", "5000"))
     print(f"🚀 Tracker starting on port {PORT} ...")
