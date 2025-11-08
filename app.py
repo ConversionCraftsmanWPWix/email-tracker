@@ -53,4 +53,92 @@ def send_alert_email(track_id, subj_decoded, rcpt, ua, ip):
         msg = MIMEText(body)
         msg["Subject"] = f"Read Alert: {subj_decoded or 'No Subject'}"
         msg["From"] = SMTP_USER
-        msg["To"] = NOTIF
+        msg["To"] = NOTIFY_TO
+
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as s:
+            s.starttls()
+            s.login(SMTP_USER, SMTP_PASS)
+            s.sendmail(SMTP_USER, [NOTIFY_TO], msg.as_string())
+
+        print(f"✅ Email alert sent for Track ID: {track_id}")
+
+    except Exception as e:
+        print(f"⚠️ Error sending alert email: {e}")
+
+def send_alert_in_background(track_id, subj_decoded, rcpt, ua, ip):
+    thread = threading.Thread(target=send_alert_email, args=(track_id, subj_decoded, rcpt, ua, ip))
+    thread.daemon = True
+    thread.start()
+
+# ---------- LOGGING ----------
+def log_open(row):
+    header = ["time_utc","track_id","subject_b64","subject","recipient","ip","user_agent"]
+    file_exists = os.path.exists(CSV_PATH)
+    with open(CSV_PATH, "a", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        if not file_exists:
+            w.writerow(header)
+        w.writerow(row)
+
+# ---------- PIXEL ROUTE ----------
+@app.route("/px.png")
+def pixel():
+    try:
+        track_id = request.args.get("id", "")
+        subj_b64 = request.args.get("s", "")
+        rcpt     = request.args.get("to", "")
+
+        subj_decoded = ""
+        if subj_b64:
+            try:
+                subj_decoded = base64.urlsafe_b64decode(subj_b64 + "==").decode("utf-8", errors="ignore")
+            except Exception:
+                subj_decoded = ""
+
+        ua = request.headers.get("User-Agent", "")
+        ip = request.headers.get("X-Forwarded-For", request.remote_addr)
+
+        # Try logging the open
+        try:
+            log_open([
+                datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'),
+                track_id,
+                subj_b64,
+                subj_decoded,
+                urllib.parse.unquote(rcpt),
+                ip,
+                ua
+            ])
+        except Exception as e:
+            print(f"⚠️ Logging failed: {e}")
+
+        # Send alert email in background thread
+        try:
+            send_alert_in_background(track_id, subj_decoded, urllib.parse.unquote(rcpt), ua, ip)
+        except Exception as e:
+            print(f"⚠️ Background alert failed: {e}")
+
+        # Always return the pixel, even if logging fails
+        resp = make_response(send_file(BytesIO(PIXEL), mimetype="image/png"))
+        resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        resp.headers["Pragma"] = "no-cache"
+        return resp
+
+    except Exception as e:
+        print(f"❌ Error in /px.png route: {e}")
+        # Always return something so browser never hangs
+        resp = make_response(send_file(BytesIO(PIXEL), mimetype="image/png"))
+        resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        resp.headers["Pragma"] = "no-cache"
+        return resp
+
+# ---------- ROOT ROUTE ----------
+@app.route("/")
+def ok():
+    return "Tracker up and running!"
+
+# ---------- MAIN ----------
+if __name__ == "__main__":
+    PORT = int(os.getenv("PORT", "5000"))
+    print(f"🚀 Tracker starting on port {PORT} ...")
+    app.run(host="0.0.0.0", port=PORT, debug=False)
