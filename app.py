@@ -1,20 +1,17 @@
-import csv, os, smtplib, base64, urllib.parse, threading
+import csv, os, base64, urllib.parse, threading, requests
 from datetime import datetime
-from email.mime.text import MIMEText
 from flask import Flask, request, make_response, send_file
 from io import BytesIO
 from dotenv import load_dotenv
 
 load_dotenv()
 
+RESEND_API_KEY = os.getenv("RESEND_API_KEY")
 NOTIFY_TO = os.getenv("NOTIFY_TO")
-SMTP_HOST  = os.getenv("SMTP_HOST")
-SMTP_PORT  = int(os.getenv("SMTP_PORT", "587"))
-SMTP_USER  = os.getenv("SMTP_USER")
-SMTP_PASS  = os.getenv("SMTP_PASS")
-CSV_PATH   = os.getenv("CSV_PATH", "opens.csv")
+NOTIFY_FROM = os.getenv("NOTIFY_FROM", "tracker@example.com")
+CSV_PATH = os.getenv("CSV_PATH", "opens.csv")
 
-# Ensure CSV file exists safely (for free Render plan)
+# Ensure CSV file exists
 try:
     if not os.path.exists(CSV_PATH):
         with open(CSV_PATH, "w", encoding="utf-8", newline="") as f:
@@ -24,22 +21,19 @@ except Exception as e:
 
 app = Flask(__name__)
 
-# 1x1 transparent PNG
+# 1×1 transparent PNG
 PIXEL = bytes.fromhex(
     "89504E470D0A1A0A0000000D49484452000000010000000108060000"
     "1F15C4890000000A49444154789C636000000200010005FE02FEA7B108B9"
     "0000000049454E44AE426082"
 )
 
-# ---------- EMAIL SENDING (background thread to avoid Render timeout) ----------
+# ---------- EMAIL ALERT USING RESEND ----------
 def send_alert_email(track_id, subj_decoded, rcpt, ua, ip):
     try:
-        if not (SMTP_HOST and SMTP_USER and SMTP_PASS and NOTIFY_TO):
-            print("⚠️ Missing email settings — skipping alert.")
+        if not RESEND_API_KEY:
+            print("⚠️ RESEND_API_KEY not set — skipping alert.")
             return
-
-        # 👇 Debug line added here
-        print(f"Connecting to {SMTP_HOST}:{SMTP_PORT} as {SMTP_USER} ...")
 
         body = (
             f"📬 Tracked email opened!\n\n"
@@ -50,25 +44,32 @@ def send_alert_email(track_id, subj_decoded, rcpt, ua, ip):
             f"User-Agent: {ua}\n"
             f"Opened at: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC\n"
         )
-        msg = MIMEText(body)
-        msg["Subject"] = f"Read Alert: {subj_decoded or 'No Subject'}"
-        msg["From"] = SMTP_USER
-        msg["To"] = NOTIFY_TO
 
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as s:
-            s.starttls()
-            s.login(SMTP_USER, SMTP_PASS)
-            s.sendmail(SMTP_USER, [NOTIFY_TO], msg.as_string())
+        headers = {
+            "Authorization": f"Bearer {RESEND_API_KEY}",
+            "Content-Type": "application/json"
+        }
+        data = {
+            "from": NOTIFY_FROM,
+            "to": [NOTIFY_TO],
+            "subject": f"Read Alert: {subj_decoded or 'No Subject'}",
+            "text": body
+        }
 
-        print(f"✅ Email alert sent for Track ID: {track_id}")
+        print(f"📡 Sending alert via Resend to {NOTIFY_TO} ...")
+        r = requests.post("https://api.resend.com/emails", headers=headers, json=data)
+        if r.status_code == 200:
+            print(f"✅ Email alert sent for Track ID: {track_id}")
+        else:
+            print(f"⚠️ Resend API error {r.status_code}: {r.text}")
 
     except Exception as e:
-        print(f"⚠️ Error sending alert email: {e}")
+        print(f"⚠️ Error sending alert via Resend: {e}")
 
 def send_alert_in_background(track_id, subj_decoded, rcpt, ua, ip):
-    thread = threading.Thread(target=send_alert_email, args=(track_id, subj_decoded, rcpt, ua, ip))
-    thread.daemon = True
-    thread.start()
+    threading.Thread(target=send_alert_email,
+                     args=(track_id, subj_decoded, rcpt, ua, ip),
+                     daemon=True).start()
 
 # ---------- LOGGING ----------
 def log_open(row):
@@ -98,7 +99,7 @@ def pixel():
         ua = request.headers.get("User-Agent", "")
         ip = request.headers.get("X-Forwarded-For", request.remote_addr)
 
-        # Try logging the open
+        # Log the open
         try:
             log_open([
                 datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'),
@@ -112,13 +113,12 @@ def pixel():
         except Exception as e:
             print(f"⚠️ Logging failed: {e}")
 
-        # Send alert email in background thread
+        # Send email alert
         try:
             send_alert_in_background(track_id, subj_decoded, urllib.parse.unquote(rcpt), ua, ip)
         except Exception as e:
             print(f"⚠️ Background alert failed: {e}")
 
-        # Always return the pixel, even if logging fails
         resp = make_response(send_file(BytesIO(PIXEL), mimetype="image/png"))
         resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
         resp.headers["Pragma"] = "no-cache"
@@ -126,18 +126,15 @@ def pixel():
 
     except Exception as e:
         print(f"❌ Error in /px.png route: {e}")
-        # Always return something so browser never hangs
         resp = make_response(send_file(BytesIO(PIXEL), mimetype="image/png"))
         resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
         resp.headers["Pragma"] = "no-cache"
         return resp
 
-# ---------- ROOT ROUTE ----------
 @app.route("/")
 def ok():
     return "Tracker up and running!"
 
-# ---------- MAIN ----------
 if __name__ == "__main__":
     PORT = int(os.getenv("PORT", "5000"))
     print(f"🚀 Tracker starting on port {PORT} ...")
