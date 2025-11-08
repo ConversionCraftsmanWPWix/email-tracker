@@ -13,6 +13,14 @@ SMTP_PORT  = int(os.getenv("SMTP_PORT", "587"))
 SMTP_USER  = os.getenv("SMTP_USER")
 SMTP_PASS  = os.getenv("SMTP_PASS")
 CSV_PATH   = os.getenv("CSV_PATH", "opens.csv")
+# Ensure CSV file exists safely (for free Render plan)
+try:
+    if not os.path.exists(CSV_PATH):
+        with open(CSV_PATH, "w", encoding="utf-8", newline="") as f:
+            f.write("time_utc,track_id,subject_b64,subject,recipient,ip,user_agent\n")
+except Exception as e:
+    print(f"⚠️ Could not create log file {CSV_PATH}: {e}")
+
 
 app = Flask(__name__)
 
