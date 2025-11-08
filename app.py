@@ -13,6 +13,7 @@ SMTP_PORT  = int(os.getenv("SMTP_PORT", "587"))
 SMTP_USER  = os.getenv("SMTP_USER")
 SMTP_PASS  = os.getenv("SMTP_PASS")
 CSV_PATH   = os.getenv("CSV_PATH", "opens.csv")
+
 # Ensure CSV file exists safely (for free Render plan)
 try:
     if not os.path.exists(CSV_PATH):
@@ -20,7 +21,6 @@ try:
             f.write("time_utc,track_id,subject_b64,subject,recipient,ip,user_agent\n")
 except Exception as e:
     print(f"⚠️ Could not create log file {CSV_PATH}: {e}")
-
 
 app = Flask(__name__)
 
@@ -87,21 +87,27 @@ def pixel():
         ua = request.headers.get("User-Agent", "")
         ip = request.headers.get("X-Forwarded-For", request.remote_addr)
 
-        # Log to CSV
-        log_open([
-            datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'),
-            track_id,
-            subj_b64,
-            subj_decoded,
-            urllib.parse.unquote(rcpt),
-            ip,
-            ua
-        ])
+        # Try logging the open
+        try:
+            log_open([
+                datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'),
+                track_id,
+                subj_b64,
+                subj_decoded,
+                urllib.parse.unquote(rcpt),
+                ip,
+                ua
+            ])
+        except Exception as e:
+            print(f"⚠️ Logging failed: {e}")
 
-        # Try to send alert email
-        send_alert_email(track_id, subj_decoded, urllib.parse.unquote(rcpt), ua, ip)
+        # Try sending alert
+        try:
+            send_alert_email(track_id, subj_decoded, urllib.parse.unquote(rcpt), ua, ip)
+        except Exception as e:
+            print(f"⚠️ Alert email failed: {e}")
 
-        # Return pixel image (no caching)
+        # Always return the pixel, even if logging fails
         resp = make_response(send_file(BytesIO(PIXEL), mimetype="image/png"))
         resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
         resp.headers["Pragma"] = "no-cache"
@@ -109,12 +115,17 @@ def pixel():
 
     except Exception as e:
         print(f"❌ Error in /px.png route: {e}")
-        return f"Internal Server Error: {e}", 500
+        # Always return something so browser never hangs
+        resp = make_response(send_file(BytesIO(PIXEL), mimetype="image/png"))
+        resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        resp.headers["Pragma"] = "no-cache"
+        return resp
 
 @app.route("/")
 def ok():
     return "Tracker up and running!"
 
 if __name__ == "__main__":
-    print("🚀 Tracker starting on port 5000 ...")
-    app.run(host="0.0.0.0", port=5000, debug=False)
+    PORT = int(os.getenv("PORT", "5000"))
+    print(f"🚀 Tracker starting on port {PORT} ...")
+    app.run(host="0.0.0.0", port=PORT, debug=False)
