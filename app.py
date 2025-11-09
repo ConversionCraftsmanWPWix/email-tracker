@@ -1,4 +1,4 @@
-import csv, os, base64, urllib.parse, threading, requests
+import csv, os, base64, urllib.parse, threading, requests, time
 from datetime import datetime
 from flask import Flask, request, make_response, send_file
 from io import BytesIO
@@ -6,12 +6,17 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# ===== CONFIG =====
 RESEND_API_KEY = os.getenv("RESEND_API_KEY")
 NOTIFY_TO = os.getenv("NOTIFY_TO")
 NOTIFY_FROM = os.getenv("NOTIFY_FROM", "tracker@example.com")
 CSV_PATH = os.getenv("CSV_PATH", "opens.csv")
 
-# Ensure CSV file exists
+# Keep track of when each email was sent
+# (In a real system you might persist this in a DB)
+SEND_TIMES = {}
+
+# Ensure CSV exists
 try:
     if not os.path.exists(CSV_PATH):
         with open(CSV_PATH, "w", encoding="utf-8", newline="") as f:
@@ -21,14 +26,14 @@ except Exception as e:
 
 app = Flask(__name__)
 
-# 1×1 transparent PNG
+# ===== 1×1 transparent PNG =====
 PIXEL = bytes.fromhex(
     "89504E470D0A1A0A0000000D49484452000000010000000108060000"
     "1F15C4890000000A49444154789C636000000200010005FE02FEA7B108B9"
     "0000000049454E44AE426082"
 )
 
-# ---------- EMAIL ALERT USING RESEND ----------
+# ===== ALERT VIA RESEND =====
 def send_alert_email(track_id, subj_decoded, rcpt, ua, ip):
     try:
         if not RESEND_API_KEY:
@@ -71,7 +76,7 @@ def send_alert_in_background(track_id, subj_decoded, rcpt, ua, ip):
                      args=(track_id, subj_decoded, rcpt, ua, ip),
                      daemon=True).start()
 
-# ---------- LOGGING ----------
+# ===== LOGGING =====
 def log_open(row):
     header = ["time_utc","track_id","subject_b64","subject","recipient","ip","user_agent"]
     file_exists = os.path.exists(CSV_PATH)
@@ -81,7 +86,7 @@ def log_open(row):
             w.writerow(header)
         w.writerow(row)
 
-# ---------- PIXEL ROUTE ----------
+# ===== PIXEL ROUTE =====
 @app.route("/px.png")
 def pixel():
     try:
@@ -99,25 +104,46 @@ def pixel():
         ua = request.headers.get("User-Agent", "")
         ip = request.headers.get("X-Forwarded-For", request.remote_addr)
 
-        # Log the open
-        try:
-            log_open([
-                datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'),
-                track_id,
-                subj_b64,
-                subj_decoded,
-                urllib.parse.unquote(rcpt),
-                ip,
-                ua
-            ])
-        except Exception as e:
-            print(f"⚠️ Logging failed: {e}")
+        # --- Ignore known bot or proxy requests ---
+        ua_lower = (ua or "").lower()
+        if any(bot in ua_lower for bot in [
+            "googleimageproxy",
+            "google",
+            "outlook",
+            "microsoft",
+            "yahoo",
+            "applemail",
+            "proxy",
+            "fastmail",
+        ]):
+            print(f"⚠️ Ignored automated fetch from {ua}")
+            resp = make_response(send_file(BytesIO(PIXEL), mimetype="image/png"))
+            resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+            resp.headers["Pragma"] = "no-cache"
+            return resp
 
-        # Send email alert
-        try:
-            send_alert_in_background(track_id, subj_decoded, urllib.parse.unquote(rcpt), ua, ip)
-        except Exception as e:
-            print(f"⚠️ Background alert failed: {e}")
+        # --- Timing safeguard: ensure 10 seconds since "sent" ---
+        now = time.time()
+        last_sent = SEND_TIMES.get(track_id, now - 999)
+        if now - last_sent < 10:
+            print(f"⚠️ Ignored open within 10s for Track ID: {track_id}")
+            resp = make_response(send_file(BytesIO(PIXEL), mimetype="image/png"))
+            resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+            resp.headers["Pragma"] = "no-cache"
+            return resp
+
+        # --- Log real opens ---
+        log_open([
+            datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'),
+            track_id,
+            subj_b64,
+            subj_decoded,
+            urllib.parse.unquote(rcpt),
+            ip,
+            ua
+        ])
+
+        send_alert_in_background(track_id, subj_decoded, urllib.parse.unquote(rcpt), ua, ip)
 
         resp = make_response(send_file(BytesIO(PIXEL), mimetype="image/png"))
         resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
@@ -131,10 +157,21 @@ def pixel():
         resp.headers["Pragma"] = "no-cache"
         return resp
 
+# ===== RECORD SEND TIME (OPTIONAL) =====
+@app.route("/sent")
+def mark_sent():
+    """Optional route to record when an email was sent (for timing filter)"""
+    track_id = request.args.get("id", "")
+    SEND_TIMES[track_id] = time.time()
+    print(f"🕒 Marked email {track_id} as sent at {datetime.utcnow()}")
+    return {"status": "ok", "track_id": track_id}
+
+# ===== ROOT =====
 @app.route("/")
 def ok():
     return "Tracker up and running!"
 
+# ===== MAIN =====
 if __name__ == "__main__":
     PORT = int(os.getenv("PORT", "5000"))
     print(f"🚀 Tracker starting on port {PORT} ...")
