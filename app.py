@@ -21,6 +21,9 @@ except Exception as e:
 
 app = Flask(__name__)
 
+# Memory cache to prevent duplicate alerts
+recent_alerts = set()
+
 # 1×1 transparent PNG
 PIXEL = bytes.fromhex(
     "89504E470D0A1A0A0000000D49484452000000010000000108060000"
@@ -115,9 +118,13 @@ def pixel():
         except Exception as e:
             print(f"⚠️ Logging failed: {e}")
 
-        # Send email alert
+        # ✅ Send alert only once per Track ID
         try:
-            send_alert_in_background(track_id, subj_decoded, urllib.parse.unquote(rcpt), ua, ip)
+            if track_id and track_id not in recent_alerts:
+                recent_alerts.add(track_id)
+                send_alert_in_background(track_id, subj_decoded, urllib.parse.unquote(rcpt), ua, ip)
+            else:
+                print(f"⏳ Skipping duplicate alert for Track ID: {track_id}")
         except Exception as e:
             print(f"⚠️ Background alert failed: {e}")
 
