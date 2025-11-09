@@ -21,8 +21,7 @@ except Exception as e:
 
 app = Flask(__name__)
 
-# In-memory recent cache to prevent duplicate spam (per cb)
-recent_opens = {}
+recent_opens = {}  # cache for 10-minute dedupe
 
 # 1×1 transparent PNG
 PIXEL = bytes.fromhex(
@@ -30,6 +29,13 @@ PIXEL = bytes.fromhex(
     "1F15C4890000000A49444154789C636000000200010005FE02FEA7B108B9"
     "0000000049454E44AE426082"
 )
+
+def pixel_response():
+    resp = make_response(send_file(BytesIO(PIXEL), mimetype="image/png"))
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    resp.headers["Pragma"] = "no-cache"
+    return resp
+
 
 # ---------- EMAIL ALERT USING RESEND ----------
 def send_alert_email(track_id, subj_decoded, rcpt, ua, ip, cb):
@@ -60,7 +66,7 @@ def send_alert_email(track_id, subj_decoded, rcpt, ua, ip, cb):
             "text": body
         }
 
-        print(f"📡 Sending alert via Resend to {NOTIFY_TO} ...")
+        print(f"📡 Sending alert via Resend to {NOTIFY_TO} …")
         r = requests.post("https://api.resend.com/emails", headers=headers, json=data)
         if r.status_code == 200:
             print(f"✅ Email alert sent for Track ID: {track_id}")
@@ -77,15 +83,17 @@ def send_alert_in_background(track_id, subj_decoded, rcpt, ua, ip, cb):
         daemon=True
     ).start()
 
+
 # ---------- LOGGING ----------
 def log_open(row):
-    header = ["time_utc", "track_id", "subject_b64", "subject", "recipient", "ip", "user_agent", "cachebuster"]
+    header = ["time_utc","track_id","subject_b64","subject","recipient","ip","user_agent","cachebuster"]
     file_exists = os.path.exists(CSV_PATH)
     with open(CSV_PATH, "a", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         if not file_exists:
             w.writerow(header)
         w.writerow(row)
+
 
 # ---------- PIXEL ROUTE ----------
 @app.route("/px.png")
@@ -105,63 +113,61 @@ def pixel():
 
         ua = request.headers.get("User-Agent", "")
         ip = request.headers.get("X-Forwarded-For", request.remote_addr)
-
-        # --- Skip duplicates only if cb seen in last 10 min ---
         now = datetime.utcnow()
-        key = f"{track_id}:{cb}"
 
+        # --- 1️⃣ Skip known proxy/bot user-agents ---
+        bot_signatures = [
+            "googleimageproxy", "outlook.office.com", "microsoft office",
+            "appleimageproxy", "thunderbird", "protection.outlook.com",
+            "mail.ru", "yahoo", "safe links"
+        ]
+        if any(sig in ua.lower() for sig in bot_signatures):
+            print(f"🤖 Prefetch detected from {ua[:80]} → skipping alert.")
+            return pixel_response()
+
+        # --- 2️⃣ Delay filter: ignore hits within 90 seconds of Render wake-up or send time ---
+        if (now - datetime.utcnow()).total_seconds() < 90:
+            print("⏳ Skipping early proxy fetch (too soon after send).")
+            return pixel_response()
+
+        # --- 3️⃣ Duplicate control by TrackID + Cache-buster ---
+        key = f"{track_id}:{cb}"
         if key in recent_opens:
             last_time = recent_opens[key]
-            diff = (now - last_time).total_seconds()
-            if diff < 600:  # 10 minutes
+            if (now - last_time).total_seconds() < 600:
                 print(f"⏳ Skipping duplicate alert for Track ID: {track_id} (cb={cb})")
-                resp = make_response(send_file(BytesIO(PIXEL), mimetype="image/png"))
-                resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
-                resp.headers["Pragma"] = "no-cache"
-                return resp
-
-        # Store this open timestamp
+                return pixel_response()
         recent_opens[key] = now
 
-        # Log open
+        # --- Log the open ---
         try:
             log_open([
                 now.strftime('%Y-%m-%d %H:%M:%S'),
-                track_id,
-                subj_b64,
-                subj_decoded,
-                urllib.parse.unquote(rcpt),
-                ip,
-                ua,
-                cb
+                track_id, subj_b64, subj_decoded,
+                urllib.parse.unquote(rcpt), ip, ua, cb
             ])
         except Exception as e:
             print(f"⚠️ Logging failed: {e}")
 
-        # Send email alert
+        # --- Trigger background alert ---
         try:
             send_alert_in_background(track_id, subj_decoded, urllib.parse.unquote(rcpt), ua, ip, cb)
         except Exception as e:
             print(f"⚠️ Background alert failed: {e}")
 
-        # Return tracking pixel
-        resp = make_response(send_file(BytesIO(PIXEL), mimetype="image/png"))
-        resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
-        resp.headers["Pragma"] = "no-cache"
-        return resp
+        return pixel_response()
 
     except Exception as e:
         print(f"❌ Error in /px.png route: {e}")
-        resp = make_response(send_file(BytesIO(PIXEL), mimetype="image/png"))
-        resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
-        resp.headers["Pragma"] = "no-cache"
-        return resp
+        return pixel_response()
+
 
 @app.route("/")
 def ok():
-    return "Tracker up and running!"
+    return "Tracker up and running! (Ping this URL every 5 min via UptimeRobot to keep awake)"
+
 
 if __name__ == "__main__":
     PORT = int(os.getenv("PORT", "5000"))
-    print(f"🚀 Tracker starting on port {PORT} ...")
+    print(f"🚀 Tracker starting on port {PORT} …")
     app.run(host="0.0.0.0", port=PORT, debug=False)
